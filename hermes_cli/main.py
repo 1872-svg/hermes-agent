@@ -2778,6 +2778,17 @@ def cmd_update(args):
 
         if commit_count == 0:
             _invalidate_update_cache()
+            # Restore stash and switch back to original branch if we moved
+            if auto_stash_ref is not None:
+                _restore_stashed_changes(
+                    git_cmd, PROJECT_ROOT, auto_stash_ref,
+                    prompt_user=prompt_for_restore,
+                )
+            if current_branch not in ("main", "HEAD"):
+                subprocess.run(
+                    git_cmd + ["checkout", current_branch],
+                    cwd=PROJECT_ROOT, capture_output=True, text=True, check=False,
+                )
             print("✓ Already up to date!")
             return
 
