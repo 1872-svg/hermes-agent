@@ -346,6 +346,16 @@ DEFAULT_CONFIG = {
         "api_key": "",     # API key for delegation.base_url (falls back to OPENAI_API_KEY)
         "max_iterations": 50,  # per-subagent iteration cap (each subagent gets its own budget,
                                # independent of the parent's max_iterations)
+        "models": {
+            # Named model presets for per-task delegation.
+            # The agent passes a model name to delegate_task, which is resolved
+            # against these presets. If no match, the value is used as a literal
+            # provider/model string (e.g. "anthropic/claude-3.5-haiku").
+            # Each preset can override: model, provider, base_url, api_key.
+            # Example:
+            # "haiku": {"model": "anthropic/claude-3.5-haiku", "provider": "anthropic"},
+            # "minimax": {"model": "MiniMax-M2.7", "provider": "minimax"},
+        },
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
@@ -2036,3 +2046,4 @@ def config_command(args):
         print("  hermes config path      Show config file path")
         print("  hermes config env-path  Show .env file path")
         sys.exit(1)
+        

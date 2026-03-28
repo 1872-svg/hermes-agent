@@ -403,6 +403,8 @@ def delegate_task(
     toolsets: Optional[List[str]] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -477,13 +479,18 @@ def delegate_task(
     children = []
     try:
         for i, t in enumerate(task_list):
+            # Per-task model override: task-level > top-level > config default
+            task_model = t.get("model") or model
+            task_provider = t.get("provider") or provider
+            task_creds = _resolve_task_credentials(task_model, task_provider, creds, cfg, parent_agent)
+
             child = _build_child_agent(
                 task_index=i, goal=t["goal"], context=t.get("context"),
-                toolsets=t.get("toolsets") or toolsets, model=creds["model"],
+                toolsets=t.get("toolsets") or toolsets, model=task_creds["model"],
                 max_iterations=effective_max_iter, parent_agent=parent_agent,
-                override_provider=creds["provider"], override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
+                override_provider=task_creds["provider"], override_base_url=task_creds["base_url"],
+                override_api_key=task_creds.get("api_key"),
+                override_api_mode=task_creds["api_mode"],
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -653,6 +660,89 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     }
 
 
+def _resolve_task_credentials(task_model: Optional[str], task_provider: Optional[str],
+                               global_creds: dict, cfg: dict, parent_agent) -> dict:
+    """Resolve credentials for a single delegated task.
+
+    Resolution order:
+    1. If task_model matches a preset name in delegation.models, use that preset's config
+    2. If task_model is a direct model string, resolve provider credentials for it
+    3. Fall back to global_creds (the existing delegation.model/provider config)
+    """
+    if not task_model:
+        return global_creds
+
+    # Check named presets
+    presets = cfg.get("models", {}) or {}
+    if task_model in presets:
+        preset = presets[task_model]
+        preset_model = preset.get("model", "")
+        preset_provider = task_provider or preset.get("provider", "")
+        preset_base_url = preset.get("base_url", "")
+        preset_api_key = preset.get("api_key", "")
+
+        if preset_base_url:
+            # Direct endpoint preset
+            api_key = preset_api_key or os.getenv("OPENAI_API_KEY", "").strip()
+            api_mode = "chat_completions"
+            provider = "custom"
+            base_lower = preset_base_url.lower()
+            if base_lower.rstrip("/").endswith("/anthropic"):
+                api_mode = "anthropic_messages"
+            if "api.anthropic.com" in base_lower:
+                provider = "anthropic"
+                api_mode = "anthropic_messages"
+            return {
+                "model": preset_model, "provider": provider,
+                "base_url": preset_base_url, "api_key": api_key,
+                "api_mode": api_mode,
+            }
+
+        if preset_provider:
+            # Resolve via runtime provider system
+            try:
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+                runtime = resolve_runtime_provider(requested=preset_provider)
+                return {
+                    "model": preset_model,
+                    "provider": runtime.get("provider"),
+                    "base_url": runtime.get("base_url"),
+                    "api_key": runtime.get("api_key", ""),
+                    "api_mode": runtime.get("api_mode"),
+                }
+            except Exception as exc:
+                logger.warning("Failed to resolve preset '%s' provider '%s': %s",
+                             task_model, preset_provider, exc)
+                return global_creds
+
+        # Preset with just model name, no provider — inherit parent provider
+        result = dict(global_creds)
+        result["model"] = preset_model
+        return result
+
+    # Not a preset — treat as direct model string
+    # If provider also given, resolve it
+    if task_provider:
+        try:
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+            runtime = resolve_runtime_provider(requested=task_provider)
+            return {
+                "model": task_model,
+                "provider": runtime.get("provider"),
+                "base_url": runtime.get("base_url"),
+                "api_key": runtime.get("api_key", ""),
+                "api_mode": runtime.get("api_mode"),
+            }
+        except Exception as exc:
+            logger.warning("Failed to resolve provider '%s' for model '%s': %s",
+                         task_provider, task_model, exc)
+
+    # Just override the model, keep global creds
+    result = dict(global_creds)
+    result["model"] = task_model
+    return result
+
+
 def _load_config() -> dict:
     """Load delegation config from CLI_CONFIG or persistent config.
 
@@ -749,6 +839,8 @@ DELEGATE_TASK_SCHEMA = {
                             "items": {"type": "string"},
                             "description": "Toolsets for this specific task",
                         },
+                        "model": {"type": "string", "description": "Model preset or identifier for this task"},
+                        "provider": {"type": "string", "description": "Provider override for this task"},
                     },
                     "required": ["goal"],
                 },
@@ -764,6 +856,22 @@ DELEGATE_TASK_SCHEMA = {
                 "description": (
                     "Max tool-calling turns per subagent (default: 50). "
                     "Only set lower for simple tasks."
+                ),
+            },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Model to use for this subagent. Can be a preset name from "
+                    "delegation.models config (e.g. 'haiku', 'sonnet', 'minimax') "
+                    "or a direct model identifier (e.g. 'anthropic/claude-3.5-haiku'). "
+                    "Default: uses delegation.model config or inherits parent model."
+                ),
+            },
+            "provider": {
+                "type": "string",
+                "description": (
+                    "Provider for this subagent (e.g. 'anthropic', 'minimax', 'openrouter'). "
+                    "Usually inferred from the model preset. Only needed for direct model identifiers."
                 ),
             },
         },
@@ -785,6 +893,8 @@ registry.register(
         toolsets=args.get("toolsets"),
         tasks=args.get("tasks"),
         max_iterations=args.get("max_iterations"),
+        model=args.get("model"),
+        provider=args.get("provider"),
         parent_agent=kw.get("parent_agent")),
     check_fn=check_delegate_requirements,
     emoji="🔀",
