@@ -98,11 +98,15 @@ def _build_child_progress_callback(task_index: int, parent_agent, task_count: in
     _BATCH_SIZE = 5
     _batch: List[str] = []
 
-    def _callback(tool_name: str, preview: str = None):
-        # Special "_thinking" event: model produced text content (reasoning)
-        if tool_name == "_thinking":
+    def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
+        # event_type is one of: "tool.started", "tool.completed",
+        # "reasoning.available", "_thinking", "subagent_progress"
+
+        # "_thinking" / reasoning events
+        if event_type in ("_thinking", "reasoning.available"):
+            text = preview or tool_name or ""
             if spinner:
-                short = (preview[:55] + "...") if preview and len(preview) > 55 else (preview or "")
+                short = (text[:55] + "...") if len(text) > 55 else text
                 try:
                     spinner.print_above(f" {prefix}├─ 💭 \"{short}\"")
                 except Exception as e:
@@ -110,11 +114,15 @@ def _build_child_progress_callback(task_index: int, parent_agent, task_count: in
             # Don't relay thinking to gateway (too noisy for chat)
             return
 
-        # Regular tool call event
+        # tool.completed — no display needed here (spinner shows on started)
+        if event_type == "tool.completed":
+            return
+
+        # tool.started — display and batch for parent relay
         if spinner:
             short = (preview[:35] + "...") if preview and len(preview) > 35 else (preview or "")
             from agent.display import get_tool_emoji
-            emoji = get_tool_emoji(tool_name)
+            emoji = get_tool_emoji(tool_name or "")
             line = f" {prefix}├─ {emoji} {tool_name}"
             if short:
                 line += f"  \"{short}\""
@@ -124,7 +132,7 @@ def _build_child_progress_callback(task_index: int, parent_agent, task_count: in
                 logger.debug("Spinner print_above failed: %s", e)
 
         if parent_cb:
-            _batch.append(tool_name)
+            _batch.append(tool_name or "")
             if len(_batch) >= _BATCH_SIZE:
                 summary = ", ".join(_batch)
                 try:
@@ -160,6 +168,9 @@ def _build_child_agent(
     override_base_url: Optional[str] = None,
     override_api_key: Optional[str] = None,
     override_api_mode: Optional[str] = None,
+    # ACP transport overrides — lets a non-ACP parent spawn ACP child agents
+    override_acp_command: Optional[str] = None,
+    override_acp_args: Optional[List[str]] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -174,12 +185,28 @@ def _build_child_agent(
 
     # When no explicit toolsets given, inherit from parent's enabled toolsets
     # so disabled tools (e.g. web) don't leak to subagents.
-    parent_toolsets = set(getattr(parent_agent, "enabled_toolsets", None) or DEFAULT_TOOLSETS)
+    # Note: enabled_toolsets=None means "all tools enabled" (the default),
+    # so we must derive effective toolsets from the parent's loaded tools.
+    parent_enabled = getattr(parent_agent, "enabled_toolsets", None)
+    if parent_enabled is not None:
+        parent_toolsets = set(parent_enabled)
+    elif parent_agent and hasattr(parent_agent, "valid_tool_names"):
+        # enabled_toolsets is None (all tools) — derive from loaded tool names
+        import model_tools
+        parent_toolsets = {
+            ts for name in parent_agent.valid_tool_names
+            if (ts := model_tools.get_toolset_for_tool(name)) is not None
+        }
+    else:
+        parent_toolsets = set(DEFAULT_TOOLSETS)
+
     if toolsets:
         # Intersect with parent — subagent must not gain tools the parent lacks
         child_toolsets = _strip_blocked_tools([t for t in toolsets if t in parent_toolsets])
-    elif parent_agent and getattr(parent_agent, "enabled_toolsets", None):
-        child_toolsets = _strip_blocked_tools(parent_agent.enabled_toolsets)
+    elif parent_agent and parent_enabled is not None:
+        child_toolsets = _strip_blocked_tools(parent_enabled)
+    elif parent_toolsets:
+        child_toolsets = _strip_blocked_tools(sorted(parent_toolsets))
     else:
         child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
 
@@ -197,14 +224,26 @@ def _build_child_agent(
     # total iterations across parent + subagents can exceed the parent's
     # max_iterations.  The user controls the per-subagent cap in config.yaml.
 
+    child_thinking_cb = None
+    if child_progress_cb:
+        def _child_thinking(text: str) -> None:
+            if not text:
+                return
+            try:
+                child_progress_cb("_thinking", text)
+            except Exception as e:
+                logger.debug("Child thinking callback relay failed: %s", e)
+
+        child_thinking_cb = _child_thinking
+
     # Resolve effective credentials: config override > parent inherit
     effective_model = model or parent_agent.model
     effective_provider = override_provider or getattr(parent_agent, "provider", None)
     effective_base_url = override_base_url or parent_agent.base_url
     effective_api_key = override_api_key or parent_api_key
     effective_api_mode = override_api_mode or getattr(parent_agent, "api_mode", None)
-    effective_acp_command = getattr(parent_agent, "acp_command", None)
-    effective_acp_args = list(getattr(parent_agent, "acp_args", []) or [])
+    effective_acp_command = override_acp_command or getattr(parent_agent, "acp_command", None)
+    effective_acp_args = list(override_acp_args if override_acp_args is not None else (getattr(parent_agent, "acp_args", []) or []))
 
     child = AIAgent(
         base_url=effective_base_url,
@@ -226,7 +265,9 @@ def _build_child_agent(
         skip_context_files=True,
         skip_memory=True,
         clarify_callback=None,
+        thinking_callback=child_thinking_cb,
         session_db=getattr(parent_agent, '_session_db', None),
+        parent_session_id=getattr(parent_agent, 'session_id', None),
         providers_allowed=parent_agent.providers_allowed,
         providers_ignored=parent_agent.providers_ignored,
         providers_order=parent_agent.providers_order,
@@ -234,6 +275,7 @@ def _build_child_agent(
         tool_progress_callback=child_progress_cb,
         iteration_budget=None,  # fresh budget per subagent
     )
+    child._print_fn = getattr(parent_agent, '_print_fn', None)
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = getattr(parent_agent, '_delegate_depth', 0) + 1
 
@@ -406,8 +448,8 @@ def delegate_task(
     toolsets: Optional[List[str]] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
-    model: Optional[str] = None,
-    provider: Optional[str] = None,
+    acp_command: Optional[str] = None,
+    acp_args: Optional[List[str]] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -482,18 +524,15 @@ def delegate_task(
     children = []
     try:
         for i, t in enumerate(task_list):
-            # Per-task model override: task-level > top-level > config default
-            task_model = t.get("model") or model
-            task_provider = t.get("provider") or provider
-            task_creds = _resolve_task_credentials(task_model, task_provider, creds, cfg, parent_agent)
-
             child = _build_child_agent(
                 task_index=i, goal=t["goal"], context=t.get("context"),
-                toolsets=t.get("toolsets") or toolsets, model=task_creds["model"],
+                toolsets=t.get("toolsets") or toolsets, model=creds["model"],
                 max_iterations=effective_max_iter, parent_agent=parent_agent,
-                override_provider=task_creds["provider"], override_base_url=task_creds["base_url"],
-                override_api_key=task_creds.get("api_key"),
-                override_api_mode=task_creds["api_mode"],
+                override_provider=creds["provider"], override_base_url=creds["base_url"],
+                override_api_key=creds["api_key"],
+                override_api_mode=creds["api_mode"],
+                override_acp_command=t.get("acp_command") or acp_command,
+                override_acp_args=t.get("acp_args") or acp_args,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -565,6 +604,19 @@ def delegate_task(
 
         # Sort by task_index so results match input order
         results.sort(key=lambda r: r["task_index"])
+
+    # Notify parent's memory provider of delegation outcomes
+    if parent_agent and hasattr(parent_agent, '_memory_manager') and parent_agent._memory_manager:
+        for entry in results:
+            try:
+                _task_goal = task_list[entry["task_index"]]["goal"] if entry["task_index"] < len(task_list) else ""
+                parent_agent._memory_manager.on_delegation(
+                    task=_task_goal,
+                    result=entry.get("summary", "") or "",
+                    child_session_id=getattr(children[entry["task_index"]][2], "session_id", "") if entry["task_index"] < len(children) else "",
+                )
+            except Exception:
+                pass
 
     total_duration = round(time.monotonic() - overall_start, 2)
 
@@ -649,7 +701,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     if not api_key:
         raise ValueError(
             f"Delegation provider '{configured_provider}' resolved but has no API key. "
-            f"Set the appropriate environment variable or run 'hermes login'."
+            f"Set the appropriate environment variable or run 'hermes auth'."
         )
 
     return {
@@ -661,89 +713,6 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
     }
-
-
-def _resolve_task_credentials(task_model: Optional[str], task_provider: Optional[str],
-                               global_creds: dict, cfg: dict, parent_agent) -> dict:
-    """Resolve credentials for a single delegated task.
-
-    Resolution order:
-    1. If task_model matches a preset name in delegation.models, use that preset's config
-    2. If task_model is a direct model string, resolve provider credentials for it
-    3. Fall back to global_creds (the existing delegation.model/provider config)
-    """
-    if not task_model:
-        return global_creds
-
-    # Check named presets
-    presets = cfg.get("models", {}) or {}
-    if task_model in presets:
-        preset = presets[task_model]
-        preset_model = preset.get("model", "")
-        preset_provider = task_provider or preset.get("provider", "")
-        preset_base_url = preset.get("base_url", "")
-        preset_api_key = preset.get("api_key", "")
-
-        if preset_base_url:
-            # Direct endpoint preset
-            api_key = preset_api_key or os.getenv("OPENAI_API_KEY", "").strip()
-            api_mode = "chat_completions"
-            provider = "custom"
-            base_lower = preset_base_url.lower()
-            if base_lower.rstrip("/").endswith("/anthropic"):
-                api_mode = "anthropic_messages"
-            if "api.anthropic.com" in base_lower:
-                provider = "anthropic"
-                api_mode = "anthropic_messages"
-            return {
-                "model": preset_model, "provider": provider,
-                "base_url": preset_base_url, "api_key": api_key,
-                "api_mode": api_mode,
-            }
-
-        if preset_provider:
-            # Resolve via runtime provider system
-            try:
-                from hermes_cli.runtime_provider import resolve_runtime_provider
-                runtime = resolve_runtime_provider(requested=preset_provider)
-                return {
-                    "model": preset_model,
-                    "provider": runtime.get("provider"),
-                    "base_url": runtime.get("base_url"),
-                    "api_key": runtime.get("api_key", ""),
-                    "api_mode": runtime.get("api_mode"),
-                }
-            except Exception as exc:
-                logger.warning("Failed to resolve preset '%s' provider '%s': %s",
-                             task_model, preset_provider, exc)
-                return global_creds
-
-        # Preset with just model name, no provider — inherit parent provider
-        result = dict(global_creds)
-        result["model"] = preset_model
-        return result
-
-    # Not a preset — treat as direct model string
-    # If provider also given, resolve it
-    if task_provider:
-        try:
-            from hermes_cli.runtime_provider import resolve_runtime_provider
-            runtime = resolve_runtime_provider(requested=task_provider)
-            return {
-                "model": task_model,
-                "provider": runtime.get("provider"),
-                "base_url": runtime.get("base_url"),
-                "api_key": runtime.get("api_key", ""),
-                "api_mode": runtime.get("api_mode"),
-            }
-        except Exception as exc:
-            logger.warning("Failed to resolve provider '%s' for model '%s': %s",
-                         task_provider, task_model, exc)
-
-    # Just override the model, keep global creds
-    result = dict(global_creds)
-    result["model"] = task_model
-    return result
 
 
 def _load_config() -> dict:
@@ -840,10 +809,17 @@ DELEGATE_TASK_SCHEMA = {
                         "toolsets": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Toolsets for this specific task",
+                            "description": "Toolsets for this specific task. Use 'web' for network access, 'terminal' for shell.",
                         },
-                        "model": {"type": "string", "description": "Model preset or identifier for this task"},
-                        "provider": {"type": "string", "description": "Provider override for this task"},
+                        "acp_command": {
+                            "type": "string",
+                            "description": "Per-task ACP command override (e.g. 'claude'). Overrides the top-level acp_command for this task only.",
+                        },
+                        "acp_args": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Per-task ACP args override.",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -861,20 +837,21 @@ DELEGATE_TASK_SCHEMA = {
                     "Only set lower for simple tasks."
                 ),
             },
-            "model": {
+            "acp_command": {
                 "type": "string",
                 "description": (
-                    "Model to use for this subagent. Can be a preset name from "
-                    "delegation.models config (e.g. 'haiku', 'sonnet', 'minimax') "
-                    "or a direct model identifier (e.g. 'anthropic/claude-3.5-haiku'). "
-                    "Default: uses delegation.model config or inherits parent model."
+                    "Override ACP command for child agents (e.g. 'claude', 'copilot'). "
+                    "When set, children use ACP subprocess transport instead of inheriting "
+                    "the parent's transport. Enables spawning Claude Code (claude --acp --stdio) "
+                    "or other ACP-capable agents from any parent, including Discord/Telegram/CLI."
                 ),
             },
-            "provider": {
-                "type": "string",
+            "acp_args": {
+                "type": "array",
+                "items": {"type": "string"},
                 "description": (
-                    "Provider for this subagent (e.g. 'anthropic', 'minimax', 'openrouter'). "
-                    "Usually inferred from the model preset. Only needed for direct model identifiers."
+                    "Arguments for the ACP command (default: ['--acp', '--stdio']). "
+                    "Only used when acp_command is set. Example: ['--acp', '--stdio', '--model', 'claude-opus-4-6']"
                 ),
             },
         },
@@ -896,8 +873,8 @@ registry.register(
         toolsets=args.get("toolsets"),
         tasks=args.get("tasks"),
         max_iterations=args.get("max_iterations"),
-        model=args.get("model"),
-        provider=args.get("provider"),
+        acp_command=args.get("acp_command"),
+        acp_args=args.get("acp_args"),
         parent_agent=kw.get("parent_agent")),
     check_fn=check_delegate_requirements,
     emoji="🔀",
