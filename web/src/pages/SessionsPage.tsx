@@ -207,22 +207,6 @@ function MessageBubble({ msg, highlight, verbose }: { msg: SessionMessage; highl
           </Badge>
         )}
       </div>
-      {msg.content && (
-        msg.role === "system"
-          ? <div className="text-sm text-foreground whitespace-pre-wrap leading-relaxed">{msg.content}</div>
-          : <Markdown content={msg.content} highlightTerms={highlightTerms} />
-      )}
-      {verbose && msg.memory_context && (
-        <CollapsibleSection
-          title="Memory Context"
-          icon={<Database className="h-3 w-3 text-emerald-400" />}
-          className="mt-2 border-emerald-500/20 bg-emerald-500/5"
-        >
-          <div className="text-emerald-300/90 whitespace-pre-wrap break-words max-h-[400px] overflow-y-auto text-xs">
-            {msg.memory_context}
-          </div>
-        </CollapsibleSection>
-      )}
       {verbose && msg.reasoning && (
         <ThinkingBlock reasoning={msg.reasoning} />
       )}
@@ -238,6 +222,22 @@ function MessageBubble({ msg, highlight, verbose }: { msg: SessionMessage; highl
               : JSON.stringify(msg.reasoning_details, null, 2)}
           </div>
         </CollapsibleSection>
+      )}
+      {verbose && msg.memory_context && (
+        <CollapsibleSection
+          title="Memory Context"
+          icon={<Database className="h-3 w-3 text-emerald-400" />}
+          className="mt-2 border-emerald-500/20 bg-emerald-500/5"
+        >
+          <div className="text-emerald-300/90 whitespace-pre-wrap break-words max-h-[400px] overflow-y-auto text-xs">
+            {msg.memory_context}
+          </div>
+        </CollapsibleSection>
+      )}
+      {msg.content && (
+        msg.role === "system"
+          ? <div className="text-sm text-foreground whitespace-pre-wrap leading-relaxed">{msg.content}</div>
+          : <Markdown content={msg.content} highlightTerms={highlightTerms} />
       )}
       {msg.tool_calls && msg.tool_calls.length > 0 && (
         <div className="mt-1">
