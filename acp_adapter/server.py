@@ -566,10 +566,15 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
     async def _replay_session_history(self, state: SessionState) -> None:
         """Replay history as user/assistant/thought chunks plus reconstructed tool-call
-        start/complete events so the editor shows the transcript, not a clean thread."""
-        if not self._conn or not state.history:
+        start/complete events so the editor shows the transcript, not a clean thread.
+
+        The replay prefers the restored DISPLAY lineage (deduped compression ancestors
+        plus compaction summaries) so a restart shows the whole conversation; the
+        model-fed ``state.history`` stays the tip's effective set."""
+        replay_history = state.display_history if state.display_history is not None else state.history
+        if not self._conn or not replay_history:
             return
-        for update in _history_replay_updates(state.history):
+        for update in _history_replay_updates(replay_history):
             if not await self._send(state.session_id, update, fail_msg="Failed to replay ACP history for session %s"):
                 return
 

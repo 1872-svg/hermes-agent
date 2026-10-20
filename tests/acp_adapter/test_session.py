@@ -560,7 +560,75 @@ class TestPersistence:
         assert restored is not None
         assert restored.session_id == plain.session_id
         assert [m["content"] for m in restored.history] == ["only turn"]
+        assert restored.display_history is None  # chain-free: replay falls back to history
         assert getattr(restored.agent, "_session_db_created", False) is not True
+
+    def test_restore_builds_display_lineage_for_replay(self, tmp_path):
+        """The session/load replay covers the WHOLE deduped compression lineage
+        (ancestors + compaction summaries) while the model-fed history stays the
+        tip's effective set — and the rotation marker on the root survives the
+        restore (reopening it would sever the lineage for later reads)."""
+        agent = SimpleNamespace(model="test-model", provider=None, base_url=None, api_mode=None)
+        db = SessionDB(tmp_path / "state.db")
+        first = SessionManager(agent_factory=lambda: agent, db=db)
+        root = first.create_session(cwd="/work")
+        root.history.append({"role": "user", "content": "early turn"})
+        root.history.append({"role": "assistant", "content": "early answer"})
+        first.save_session(root.session_id)
+        db.end_session(root.session_id, "compression")
+        tip_id = "20261020_011007_aecb05"
+        db.create_session(session_id=tip_id, source="acp", model="test-model",
+                          cwd="/work", parent_session_id=root.session_id)
+        db.replace_messages(tip_id, [{"role": "user", "content": "post-rotation question"},
+                                     {"role": "assistant", "content": "post-rotation answer"}])
+
+        second = SessionManager(agent_factory=lambda: agent, db=db)
+        restored = second.get_session(root.session_id)
+
+        assert restored is not None
+        # Model context: tip-effective only — compaction must not regrow.
+        assert [m["content"] for m in restored.history] == [
+            "post-rotation question", "post-rotation answer"]
+        # Display: the full lineage, root -> tip.
+        assert [m["content"] for m in (restored.display_history or [])] == [
+            "early turn", "early answer", "post-rotation question", "post-rotation answer"]
+        # The rotation marker on the root is preserved, not reopened away.
+        row = db.get_session(root.session_id)
+        assert row["end_reason"] == "compression"
+        assert row["ended_at"] is not None
+
+    def test_display_replay_respects_resume_cap_and_drops_dangling_tool_rows(self, tmp_path, monkeypatch):
+        """The display replay is bounded by the shared sessions.max_resume_messages
+        guard; a tail slice that opens inside a tool pair drops the leading tool
+        rows instead of emitting dangling tool-call starts."""
+        import acp_adapter.session as acp_session
+        agent = SimpleNamespace(model="test-model", provider=None, base_url=None, api_mode=None)
+        db = SessionDB(tmp_path / "state.db")
+        first = SessionManager(agent_factory=lambda: agent, db=db)
+        root = first.create_session(cwd="/work")
+        root.history.append({"role": "user", "content": "early turn"})
+        first.save_session(root.session_id)
+        db.end_session(root.session_id, "compression")
+        tip_id = "20261020_011007_aecb05"
+        db.create_session(session_id=tip_id, source="acp", model="test-model",
+                          cwd="/work", parent_session_id=root.session_id)
+        db.replace_messages(tip_id, [
+            {"role": "tool", "tool_call_id": "t1", "tool_name": "terminal", "content": "orphan result"},
+            {"role": "user", "content": "recent question"},
+            {"role": "assistant", "content": "recent answer"},
+        ])
+        monkeypatch.setattr(acp_session, "resolved_max_resume_messages", lambda: 2)
+
+        second = SessionManager(agent_factory=lambda: agent, db=db)
+        restored = second.get_session(root.session_id)
+
+        assert restored is not None
+        # Tail-capped to the most recent messages; the leading orphan tool row is
+        # dropped rather than replayed as a dangling tool call.
+        assert [m["content"] for m in (restored.display_history or [])] == [
+            "recent question", "recent answer"]
+        # Model context is untouched by the display cap.
+        assert len(restored.history) == 3
 
     def test_end_all_sessions_without_db_is_a_noop(self):
         """Teardown must never raise; a DB-unavailable process just ends nothing."""

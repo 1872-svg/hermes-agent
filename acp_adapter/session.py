@@ -7,6 +7,7 @@ survive process restarts and appear in ``session_search``; ``load_session`` /
 from __future__ import annotations
 
 from hermes_constants import get_hermes_home, translate_cwd_for_wsl_backend, windows_path_to_wsl
+from hermes_state import resolved_max_resume_messages
 
 import copy
 import json
@@ -123,6 +124,20 @@ def _session_info(sid: str, cwd: str, model: Any, history_len: int, title: Any, 
             "title": _build_session_title(title, preview, cwd), "updated_at": _format_updated_at(updated_at)}
 
 
+def _trim_display_history_for_replay(messages: list[dict[str, Any]],
+                                     limit: int) -> list[dict[str, Any]]:
+    """Bound the display-lineage replay to the most recent *limit* messages (the shared
+    ``sessions.max_resume_messages`` guard; 0 disables the cap). A tail slice can open
+    inside a tool pair — drop leading tool rows, whose start events would otherwise
+    render as dangling tool calls in the client."""
+    if limit <= 0 or len(messages) <= limit:
+        return messages
+    trimmed = messages[-limit:]
+    while trimmed and trimmed[0].get("role") == "tool":
+        trimmed = trimmed[1:]
+    return trimmed
+
+
 def _first_user_preview(history: list[dict[str, Any]], default: str) -> str:
     return next((str(m.get("content") or "").strip() for m in history
                  if m.get("role") == "user" and str(m.get("content") or "").strip()), default)
@@ -137,6 +152,11 @@ class SessionState:
     cwd: str = "."
     model: str = ""
     history: list[dict[str, Any]] = field(default_factory=list)
+    # Display-only lineage for session/load replay: the deduped compression lineage
+    # (ancestors + compaction summaries), NOT the model-fed context — state.history
+    # stays the tip's effective set so a restore never regrows what compaction
+    # summarized away. None → replay falls back to history (chain-free sessions).
+    display_history: list[dict[str, Any]] | None = None
     cancel_event: Any = None  # threading.Event
     is_running: bool = False
     # A state-mutating slash command (/reset, /compress, /model) is in flight. Turn claims
@@ -305,10 +325,12 @@ class SessionManager:
     # ---- persistence via SessionDB ------------------------------------------
 
     def _install_state(self, session_id: str, agent: Any, cwd: str, model: str,
-                       history: list[dict[str, Any]], *, persist: bool = True) -> SessionState:
+                       history: list[dict[str, Any]], *, persist: bool = True,
+                       display_history: list[dict[str, Any]] | None = None) -> SessionState:
         """Build a SessionState, register it in memory, bind its cwd for tools, optionally persist."""
         state = SessionState(session_id=session_id, agent=agent, cwd=cwd, model=model,
-                             history=history, cancel_event=threading.Event())
+                             history=history, display_history=display_history,
+                             cancel_event=threading.Event())
         with self._lock:
             self._sessions[session_id] = state
         _register_task_cwd(session_id, cwd)
@@ -459,8 +481,12 @@ class SessionManager:
 
         # A previous adapter process stamped the row ended at its stdio
         # shutdown (#118216); resuming the conversation reopens it, the same
-        # contract the TUI gateway's cold-resume path uses.
-        if row.get("ended_at") is not None:
+        # contract the TUI gateway's cold-resume path uses. A 'compression' end
+        # is NOT a session end — it is the rotation marker that lineage walks
+        # (parent ended 'compression') rely on, so reopening it would sever the
+        # chain root and hide the pre-compaction segment from every later
+        # lineage read. Reopen only genuine shutdown/idle ends.
+        if row.get("ended_at") is not None and row.get("end_reason") != "compression":
             try:
                 db.reopen_session(session_id)
             except Exception:
@@ -491,6 +517,21 @@ class SessionManager:
             logger.warning("Failed to load messages for ACP session %s", session_id, exc_info=True)
             history = []
 
+        # Display-only full lineage for the session/load replay (see SessionState.display_history):
+        # the same deduped ancestor + compaction-summary read the TUI/Desktop display path uses.
+        # Bounded by the shared resume-size guard; failure falls back to the tip-only replay.
+        display_history: list[dict[str, Any]] | None = None
+        if resume_id != session_id:
+            try:
+                display_history = db.get_messages_as_conversation(
+                    resume_id, include_ancestors=True, include_compacted=True)
+                display_history = _trim_display_history_for_replay(
+                    display_history, resolved_max_resume_messages())
+            except Exception:
+                logger.debug("Failed to load display lineage for ACP session %s",
+                             session_id, exc_info=True)
+                display_history = None
+
         try:
             agent = self._make_agent(
                 session_id=resume_id, cwd=cwd, model=model, api_mode=meta.get("api_mode") or None,
@@ -509,7 +550,7 @@ class SessionManager:
             agent._session_db = db
             agent._session_db_created = True
         state = self._install_state(session_id, agent, cwd, model or getattr(agent, "model", "") or "",
-                                    history, persist=False)
+                                    history, persist=False, display_history=display_history)
         logger.info("Restored ACP session %s from DB (%d messages)", session_id, len(history))
         return state
 
