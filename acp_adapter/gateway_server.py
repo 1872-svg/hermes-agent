@@ -334,8 +334,13 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             if str(exc) != "not_found":
                 raise
         adopted = await client.rpc("session.resume", session_id=session_id)
-        await client.rpc("session.detach", session_id=session_id, subscription_id=adopted["subscription_id"])
-        return await client.rpc("session.info", session_id=session_id)
+        # A cold resume of a compression-rotated id rebinds the live session to the tip
+        # (stored_session_id, the same follow-the-tip contract the TUI resume applies);
+        # the pre-resume id is no longer addressable, so detach/info must use the
+        # rebound id or the adopt path fails not_found right after succeeding.
+        rebound = str(adopted.get("session_id") or session_id)
+        await client.rpc("session.detach", session_id=rebound, subscription_id=adopted["subscription_id"])
+        return await client.rpc("session.info", session_id=rebound)
 
     async def _resume(self, cwd, held_id, mcp_servers):
         client = await self._client()
