@@ -138,6 +138,45 @@ def _trim_display_history_for_replay(messages: list[dict[str, Any]],
     return trimmed
 
 
+def _sort_display_by_timestamp(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Order the display lineage chronologically.
+
+    The DB read orders rows by insertion id (flush order), and compaction-time flushes
+    write a parent's pending rows AFTER the child's summary row — so id order shows the
+    summary before the content it summarizes and pushes early messages (flushed late)
+    toward the end of the replay. Timestamps are the truth for a display timeline;
+    the sort is stable so same-second rows keep their stored relative order."""
+    return sorted(
+        messages,
+        key=lambda m: float(m.get("timestamp") or 0),
+    )
+
+
+def _collapse_user_restatements(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse cross-generation user restatements to their first occurrence.
+
+    The compaction machinery re-carries the active user request into every new
+    generation (and delegation notifications ride along as user rows), so a display
+    read across a long compression lineage shows the same request once per
+    generation. For the timeline each logical user message should appear once, at
+    the position it was originally sent; compaction summaries (distinct per
+    generation) stay as boundary markers. Only user rows collapse — assistant and
+    tool rows never do (tool rows pair with assistant tool_calls)."""
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for message in messages:
+        if message.get("role") == "user":
+            content = message.get("content")
+            if isinstance(content, str):
+                norm = " ".join(content.split())
+                if norm in seen:
+                    continue
+                if norm:
+                    seen.add(norm)
+        out.append(message)
+    return out
+
+
 def _first_user_preview(history: list[dict[str, Any]], default: str) -> str:
     return next((str(m.get("content") or "").strip() for m in history
                  if m.get("role") == "user" and str(m.get("content") or "").strip()), default)
@@ -525,6 +564,8 @@ class SessionManager:
             try:
                 display_history = db.get_messages_as_conversation(
                     resume_id, include_ancestors=True, include_compacted=True)
+                display_history = _sort_display_by_timestamp(display_history)
+                display_history = _collapse_user_restatements(display_history)
                 display_history = _trim_display_history_for_replay(
                     display_history, resolved_max_resume_messages())
             except Exception:

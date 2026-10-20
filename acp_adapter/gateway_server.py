@@ -332,13 +332,17 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         ``sessions.max_resume_messages`` guard."""
         try:
             from hermes_state import SessionDB, resolved_max_resume_messages
-            from acp_adapter.session import _trim_display_history_for_replay
+            from acp_adapter.session import (_trim_display_history_for_replay,
+                                             _sort_display_by_timestamp,
+                                             _collapse_user_restatements)
             with SessionDB(db_path=self._home / "state.db", read_only=True) as db:
                 lineage = db.get_compression_lineage(session_id)
                 tip = lineage[-1] if lineage else session_id
                 messages = db.get_messages_as_conversation(
                     tip, include_ancestors=True, include_compacted=True)
-            return _trim_display_history_for_replay(messages, resolved_max_resume_messages())
+            return _trim_display_history_for_replay(
+                _collapse_user_restatements(_sort_display_by_timestamp(messages)),
+                resolved_max_resume_messages())
         except Exception:
             logger.debug("display lineage read failed for %s; replaying the live transcript",
                          session_id, exc_info=True)
