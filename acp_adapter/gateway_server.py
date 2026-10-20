@@ -324,6 +324,26 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             # Boundary: a detached editor or a refused read is not the attach's failure.
             logger.debug("ACP post-attach notices for %s not delivered", session_id, exc_info=True)
 
+    def _display_lineage(self, session_id, fallback):
+        """Deduped compression lineage (ancestors + compaction summaries) for the resume replay,
+        so an editor sees the whole conversation after a restart instead of only the live
+        effective set. Display-only — the authority's live snapshot stays the model-fed context.
+        Falls back to the live transcript when the read fails; bounded by the shared
+        ``sessions.max_resume_messages`` guard."""
+        try:
+            from hermes_state import SessionDB, resolved_max_resume_messages
+            from acp_adapter.session import _trim_display_history_for_replay
+            with SessionDB(db_path=self._home / "state.db", read_only=True) as db:
+                lineage = db.get_compression_lineage(session_id)
+                tip = lineage[-1] if lineage else session_id
+                messages = db.get_messages_as_conversation(
+                    tip, include_ancestors=True, include_compacted=True)
+            return _trim_display_history_for_replay(messages, resolved_max_resume_messages())
+        except Exception:
+            logger.debug("display lineage read failed for %s; replaying the live transcript",
+                         session_id, exc_info=True)
+            return fallback
+
     async def _attach_info(self, client, session_id):
         """``session.info`` for a session to attach. A thread main's in-process server wrote has no
         gateway policy yet; ``session.resume`` is the verb that adopts it (``LEGACY_LOCAL_SOURCES``)."""
@@ -381,9 +401,11 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         from acp_adapter.server import _history_replay_updates
         if self._conn:
             # The editor replays the live transcript in stored order, as main's ACP did; archived rows
-            # (summarized away by a compression) are display-only.
+            # (summarized away by a compression) are display-only. Prefer the deduped display lineage
+            # (ancestors + compaction summaries) so a restart shows the WHOLE conversation; the
+            # authority's live snapshot stays the model-fed context — this replay is display-only.
             live = sorted((m for m in snapshot["messages"] if not m.get("archived")), key=lambda m: m.get("row_id") or 0)
-            for update in _history_replay_updates(live):
+            for update in _history_replay_updates(self._display_lineage(session_id, fallback=live)):
                 await self._conn.session_update(session_id=held_id, update=update)
         for pending in snapshot.get("prompts", []):
             self._permission(session_id, pending)
