@@ -494,6 +494,74 @@ class TestPersistence:
         assert row["ended_at"] is None
         assert row["end_reason"] is None
 
+    def test_restore_after_compression_rotation_resumes_at_tip(self, tmp_path, monkeypatch):
+        """#49226: automatic compression rotates the agent onto a child session, so the
+        ROOT ACP id's own rows hold only the pre-rotation segment. A restart that
+        restores the root must resume at the live tip — the same resolution the TUI
+        gateway's cold resume applies — while the ACP id stays the client's handle."""
+        agent = SimpleNamespace(model="test-model", provider=None, base_url=None, api_mode=None)
+        db = SessionDB(tmp_path / "state.db")
+        first = SessionManager(agent_factory=lambda: agent, db=db)
+        root = first.create_session(cwd="/work")
+        root.history.append({"role": "user", "content": "pre-rotation turn"})
+        root.history.append({"role": "assistant", "content": "pre-rotation answer"})
+        first.save_session(root.session_id)
+        # The rotation: the root ends on compression and a child continuation
+        # carries the compaction summary plus the newer turns.
+        db.end_session(root.session_id, "compression")
+        tip_id = "20261020_011007_aecb05"
+        db.create_session(session_id=tip_id, source="acp", model="test-model",
+                          cwd="/work", parent_session_id=root.session_id)
+        tip_history = [
+            {"role": "user", "content": "post-rotation question"},
+            {"role": "assistant", "content": "post-rotation answer"},
+        ]
+        db.replace_messages(tip_id, tip_history)
+
+        # Spy on the agent rebuild: the agent must be created ON THE TIP (its turns
+        # flush to the tip row), not on the root.
+        make_agent_calls: list[str] = []
+        original_make_agent = SessionManager._make_agent
+
+        def spy_make_agent(self, **kwargs):
+            make_agent_calls.append(kwargs.get("session_id"))
+            return original_make_agent(self, **kwargs)
+
+        monkeypatch.setattr(SessionManager, "_make_agent", spy_make_agent)
+
+        second = SessionManager(agent_factory=lambda: agent, db=db)
+        restored = second.get_session(root.session_id)
+
+        assert restored is not None
+        # The client-facing id is unchanged; the loaded conversation is the tip's.
+        assert restored.session_id == root.session_id
+        assert [m["content"] for m in restored.history] == [
+            "post-rotation question", "post-rotation answer"]
+        assert make_agent_calls == [tip_id]
+        # The rebuilt agent OWNS the tip row — both halves of _persist()'s ownership
+        # guard — so its replace_messages fallback can never rewrite the ROOT id's
+        # stored segment with the tip's history.
+        assert restored.agent._session_db is db
+        assert restored.agent._session_db_created is True
+
+    def test_restore_of_chain_free_session_keeps_its_own_rows(self, tmp_path):
+        """A session without a compression lineage restores exactly its own messages;
+        the tip resolution must be a no-op there."""
+        agent = SimpleNamespace(model="test-model", provider=None, base_url=None, api_mode=None)
+        db = SessionDB(tmp_path / "state.db")
+        first = SessionManager(agent_factory=lambda: agent, db=db)
+        plain = first.create_session(cwd="/work")
+        plain.history.append({"role": "user", "content": "only turn"})
+        first.save_session(plain.session_id)
+
+        second = SessionManager(agent_factory=lambda: agent, db=db)
+        restored = second.get_session(plain.session_id)
+
+        assert restored is not None
+        assert restored.session_id == plain.session_id
+        assert [m["content"] for m in restored.history] == ["only turn"]
+        assert getattr(restored.agent, "_session_db_created", False) is not True
+
     def test_end_all_sessions_without_db_is_a_noop(self):
         """Teardown must never raise; a DB-unavailable process just ends nothing."""
         manager = SessionManager(

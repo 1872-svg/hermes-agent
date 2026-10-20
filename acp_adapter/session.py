@@ -469,22 +469,45 @@ class SessionManager:
         meta = _parse_model_config(row.get("model_config"))
         cwd, model = meta.get("cwd", "."), row.get("model") or None
 
+        # Automatic compression rotates the agent onto a child session (the parent row ends
+        # with end_reason 'compression' and newer turns land in the child). Restoring the
+        # ROOT ACP id would therefore replay only the pre-compaction segment (#49226):
+        # resolve the resume target to the live tip, the same resolution the TUI gateway's
+        # cold resume applies. The ACP id itself stays stable — it remains the client's
+        # handle and this manager's map key; only the storage target moves.
+        resume_id = session_id
+        try:
+            resume_id = db.resolve_resume_session_id(session_id) or session_id
+        except Exception:
+            logger.debug("Failed to resolve compression tip for ACP session %s", session_id, exc_info=True)
+        if resume_id != session_id:
+            logger.info("Restoring ACP session %s at compression tip %s", session_id, resume_id)
+
         # repair_alternation: this list becomes the resumed agent's LIVE conversation; a durable
         # ``user;user`` violation in state.db would otherwise re-fire the pre-request repair every request.
         try:
-            history = db.get_messages_as_conversation(session_id, repair_alternation=True)
+            history = db.get_messages_as_conversation(resume_id, repair_alternation=True)
         except Exception:
             logger.warning("Failed to load messages for ACP session %s", session_id, exc_info=True)
             history = []
 
         try:
             agent = self._make_agent(
-                session_id=session_id, cwd=cwd, model=model, api_mode=meta.get("api_mode") or None,
+                session_id=resume_id, cwd=cwd, model=model, api_mode=meta.get("api_mode") or None,
                 requested_provider=meta.get("provider") or row.get("billing_provider"),
                 base_url=meta.get("base_url") or row.get("billing_base_url"))
         except Exception:
             logger.warning("Failed to recreate agent for ACP session %s", session_id, exc_info=True)
             return None
+        if resume_id != session_id:
+            # The tip row already exists (the pre-restart process created it) and the loaded
+            # history is born-durable. Owning the row mirrors the live post-rotation agent:
+            # new turns append to the tip, and _persist()'s replace_messages fallback must
+            # never rewrite the ROOT id's stored segment with the tip's history. The db
+            # handle matters as much as the flag — _persist()'s ownership guard needs both,
+            # and a test/agent-factory agent does not get a session_db from its factory.
+            agent._session_db = db
+            agent._session_db_created = True
         state = self._install_state(session_id, agent, cwd, model or getattr(agent, "model", "") or "",
                                     history, persist=False)
         logger.info("Restored ACP session %s from DB (%d messages)", session_id, len(history))
