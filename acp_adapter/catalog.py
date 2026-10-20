@@ -55,7 +55,19 @@ def logical_session_id(path, session_id):
     with SessionDB(db_path=path, read_only=True) as db:
         lineage = db.get_compression_lineage(session_id)
         root = lineage[0] if lineage else session_id
-        return _local_owners(db).get(root, root)
+        owners = _local_owners(db)
+        if root in owners:
+            return owners[root]
+        # The receipt can sit on a later lineage segment: the authority rewrites its policy
+        # receipt at each hosted compression rotation (keyed by the new session id), so a
+        # long-compacted conversation may have no root receipt at all. Prefer the most
+        # recent receipted id in the lineage — the id the authority's policy actually
+        # covers — over the bare root, which no receipt guards (editor mutations on it
+        # are refused with runtime_coordination_required).
+        for physical in reversed(lineage):
+            if physical in owners:
+                return owners[physical]
+        return root
 
 
 def catalog_sessions(path, cwd=None):
